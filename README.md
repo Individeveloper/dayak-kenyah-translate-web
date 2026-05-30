@@ -20,8 +20,8 @@ graph TD
     DB -->|4. Retrieve Contextual Vocab| BE
     BE -->|5. Grounded Prompt| LLM[Gemini 2.5 Flash]
     LLM -->|6. Stream Response| BE
-    BE -->|7. SSE Stream (Tokens & Metadata)| FE
-    FE -->|8. Render Translation & Learning Panel| User
+    BE -->|7. SSE Stream with Tokens and Metadata| FE
+    FE -->|8. Render Translation and Learning Panel| User
 ```
 
 ---
