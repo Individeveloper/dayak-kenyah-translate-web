@@ -14,6 +14,7 @@ Run with:
   uvicorn main:app --reload --port 8000
 """
 
+import json
 import logging
 import os
 import sys
@@ -23,6 +24,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from rag.document_processor import process_file
@@ -263,6 +265,133 @@ async def api_translate(request: TranslateRequest):
         )
 
     return TranslateResponse(**result)
+
+
+@app.post(
+    "/api/translate/stream",
+    summary="Translate text with streaming",
+    description="Stream translation tokens via Server-Sent Events (SSE).",
+)
+async def api_translate_stream(request: TranslateRequest):
+    """
+    Streaming translation endpoint using Server-Sent Events.
+
+    Sends 3 event types:
+      - data: {"type": "token", "text": "..."} — partial translation text
+      - data: {"type": "complete", ...full result...} — final complete result
+      - data: {"type": "error", "message": "..."} — on failure
+    """
+    if vector_store is None:
+        async def error_gen():
+            yield f'data: {json.dumps({"type": "error", "message": "Vector store not initialized."})}\n\n'
+        return StreamingResponse(error_gen(), media_type="text/event-stream")
+
+    import os
+    from google import genai
+    from google.genai import types as genai_types
+    from rag.cache import cache_get, cache_set
+    from rag.translator import (
+        _SINGLE_WORD_RE, _direct_lookup, _extract_json,
+        _validate_response, _format_context
+    )
+    from rag.prompts import build_translation_prompt
+
+    text = request.text.strip()
+    source_lang = request.source_lang
+    target_lang = request.target_lang
+
+    async def generate():
+        # ── 0. Cache check ─────────────────────────────────────────────────
+        cached = cache_get(text, source_lang, target_lang)
+        if cached:
+            # Send full translation at once (it's already instant from cache)
+            yield f'data: {json.dumps({"type": "token", "text": cached["translation"]})}\n\n'
+            yield f'data: {json.dumps({"type": "complete", **cached})}\n\n'
+            return
+
+        # ── 1. Direct lookup for single words ──────────────────────────────
+        if _SINGLE_WORD_RE.match(text) and len(text.split()) == 1:
+            direct = _direct_lookup(text, source_lang, target_lang, vector_store)
+            if direct:
+                cache_set(text, source_lang, target_lang, direct)
+                yield f'data: {json.dumps({"type": "token", "text": direct["translation"]})}\n\n'
+                yield f'data: {json.dumps({"type": "complete", **direct})}\n\n'
+                return
+
+        # ── 2. Gemini streaming ────────────────────────────────────────────
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key or api_key == "your_api_key_here":
+            yield f'data: {json.dumps({"type": "error", "message": "No valid Gemini API key."})}\n\n'
+            return
+
+        try:
+            search_results = vector_store.search(query=text, n_results=5)
+            dictionary_context = _format_context(search_results)
+        except Exception as exc:
+            dictionary_context = "(Dictionary search failed.)"
+            search_results = []
+
+        system_prompt, user_prompt = build_translation_prompt(
+            input_text=text,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            dictionary_context=dictionary_context,
+        )
+
+        client = genai.Client(api_key=api_key)
+        full_text = ""
+
+        try:
+            for chunk in client.models.generate_content_stream(
+                model="gemini-2.5-flash",
+                contents=user_prompt,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.2,
+                    max_output_tokens=4096,
+                    response_mime_type="application/json",
+                ),
+            ):
+                if chunk.text:
+                    full_text += chunk.text
+                    # Try to extract partial translation from growing JSON
+                    # Look for "translation": "..." pattern in the buffer
+                    import re
+                    partial_match = re.search(
+                        r'"translation"\s*:\s*"((?:[^"\\]|\\.)*)("?)',
+                        full_text
+                    )
+                    if partial_match:
+                        partial_text = partial_match.group(1)
+                        # Unescape common JSON escapes
+                        partial_text = partial_text.replace('\\n', ' ').replace('\\"', '"')
+                        yield f'data: {json.dumps({"type": "token", "text": partial_text})}\n\n'
+
+        except Exception as exc:
+            yield f'data: {json.dumps({"type": "error", "message": str(exc)})}\n\n'
+            return
+
+        # ── 3. Parse complete response and send ────────────────────────────
+        try:
+            parsed = _extract_json(full_text)
+            result = _validate_response(parsed)
+            result["error"] = False
+            result["dictionary_entries_used"] = len(search_results)
+            result["from_cache"] = False
+            result["from_direct_lookup"] = False
+            cache_set(text, source_lang, target_lang, result)
+            yield f'data: {json.dumps({"type": "complete", **result})}\n\n'
+        except Exception as exc:
+            yield f'data: {json.dumps({"type": "error", "message": f"Parse error: {str(exc)}"})}\n\n'
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post(
